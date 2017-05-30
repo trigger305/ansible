@@ -24,13 +24,13 @@ import threading
 import time
 
 from collections import deque
-from multiprocessing import Lock
 from jinja2.exceptions import UndefinedError
 
 from ansible import constants as C
 from ansible.errors import AnsibleError, AnsibleParserError, AnsibleUndefinedVariable
 from ansible.executor import action_write_locks
-from ansible.executor.process.worker import WorkerProcess
+#from ansible.executor.process.worker import WorkerProcess
+from ansible.executor.process.threading import run_worker
 from ansible.executor.task_result import TaskResult
 from ansible.inventory.host import Host
 from ansible.module_utils.six.moves import queue as Queue
@@ -54,9 +54,6 @@ except ImportError:
 
 __all__ = ['StrategyBase']
 
-class StrategySentinel:
-    pass
-
 # TODO: this should probably be in the plugins/__init__.py, with
 #       a smarter mechanism to set all of the attributes based on
 #       the loaders created there
@@ -74,21 +71,30 @@ class SharedPluginLoaderObj:
         self.module_loader = module_loader
 
 
-_sentinel = StrategySentinel()
 def results_thread_main(strategy):
-    while True:
+    while not strategy._tqm._terminated:
         try:
-            result = strategy._final_q.get()
-            if isinstance(result, StrategySentinel):
-                break
-            else:
-                strategy._results_lock.acquire()
-                strategy._results.append(result)
-                strategy._results_lock.release()
-        except (IOError, EOFError):
-            break
-        except Queue.Empty:
+            did_work = False
+            for idx, slot in enumerate(strategy._tqm._workers):
+                (w_thread, w_lock) = slot
+                try:
+                    w_lock.acquire()
+                    if w_thread and w_thread.done():
+                        result = w_thread.result()
+                        try:
+                            strategy._results_lock.acquire()
+                            strategy._results.append(result)
+                        finally:
+                            strategy._results_lock.release()
+                        strategy._tqm._workers[idx] = [None, w_lock]
+                        did_work = True
+                finally:
+                    w_lock.release()
+            if not did_work:
+                time.sleep(C.DEFAULT_INTERNAL_POLL_INTERVAL)
+        except Exception as e:
             pass
+    print("RESULTS THREAD EXITED!!!")
 
 class StrategyBase:
 
@@ -100,12 +106,11 @@ class StrategyBase:
     def __init__(self, tqm):
         self._tqm               = tqm
         self._inventory         = tqm.get_inventory()
-        self._workers           = tqm.get_workers()
+        self._workers           = tqm._workers #get_workers()
         self._notified_handlers = tqm._notified_handlers
         self._listening_handlers = tqm._listening_handlers
         self._variable_manager  = tqm.get_variable_manager()
         self._loader            = tqm.get_loader()
-        self._final_q           = tqm._final_q
         self._step              = getattr(tqm._options, 'step', False)
         self._diff              = getattr(tqm._options, 'diff', False)
 
@@ -129,7 +134,7 @@ class StrategyBase:
         self._results_thread.start()
 
     def cleanup(self):
-        self._final_q.put(_sentinel)
+        self._tqm.terminate()
         self._results_thread.join()
 
     def run(self, iterator, play_context, result=0):
@@ -199,11 +204,10 @@ class StrategyBase:
 
         if task.action not in action_write_locks.action_write_locks:
             display.debug('Creating lock for %s' % task.action)
-            action_write_locks.action_write_locks[task.action] = Lock()
+            action_write_locks.action_write_locks[task.action] = threading.Lock()
 
         # and then queue the new task
         try:
-
             # create a dummy object with plugin loaders set as an easier
             # way to share them with the forked processes
             shared_loader_obj = SharedPluginLoaderObj()
@@ -211,11 +215,19 @@ class StrategyBase:
             queued = False
             starting_worker = self._cur_worker
             while True:
-                (worker_prc, rslt_q) = self._workers[self._cur_worker]
-                if worker_prc is None or not worker_prc.is_alive():
-                    worker_prc = WorkerProcess(self._final_q, task_vars, host, task, play_context, self._loader, self._variable_manager, shared_loader_obj)
-                    self._workers[self._cur_worker][0] = worker_prc
-                    worker_prc.start()
+                (w_thread, w_lock) = self._workers[self._cur_worker]
+                if w_thread is None:
+                    w_thread = self._tqm._executor.submit(
+                        run_worker,
+                        task_vars,
+                        host,
+                        task,
+                        play_context,
+                        self._loader,
+                        self._variable_manager,
+                        shared_loader_obj
+                    )
+                    self._workers[self._cur_worker][0] = w_thread
                     display.debug("worker is %d (out of %d available)" % (self._cur_worker+1, len(self._workers)))
                     queued = True
                 self._cur_worker += 1
