@@ -82,7 +82,7 @@ Function Compare-Data {
         } else {
             return $false
         }
-    } elseif ($ReferenceData -is [string] -or $ReferenceData -is [int]) {
+    } elseif ($ReferenceData -is [string] -or $ReferenceData -is [int] -or $ReferenceData -is [uint32]) {
         if ($ReferenceData -eq $DifferenceData) {
             return $true
         } else {
